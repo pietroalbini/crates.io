@@ -8,8 +8,8 @@ use tempfile::{Builder, TempDir};
 use url::Url;
 
 use crate::background_jobs::Environment;
-use crate::models::{DependencyKind, Version};
-use crate::schema::versions;
+use crate::models::{Crate as CrateModel, DependencyKind, Version};
+use crate::schema::{crates, versions};
 
 static DEFAULT_GIT_SSH_USERNAME: &str = "git";
 
@@ -312,22 +312,13 @@ pub fn yank(
             return Ok(());
         }
 
-        let prev = fs::read_to_string(&dst)?;
         let version_num = version.num.to_string();
-        let new = prev
-            .lines()
-            .map(|line| {
-                let mut git_crate = serde_json::from_str::<Crate>(line)
-                    .map_err(|_| format!("couldn't decode: `{}`", line))?;
-                if git_crate.name != krate || git_crate.vers != version_num {
-                    return Ok(line.to_string());
-                }
+        filter_map_crate(&dst, |mut git_crate| {
+            if git_crate.name == krate && git_crate.vers == version_num {
                 git_crate.yanked = Some(yanked);
-                Ok(serde_json::to_string(&git_crate)?)
-            })
-            .collect::<Result<Vec<_>, PerformError>>();
-        let new = new?.join("\n") + "\n";
-        fs::write(&dst, new.as_bytes())?;
+            }
+            Some(git_crate)
+        })?;
 
         let message: String = format!(
             "{} crate `{}#{}`",
@@ -344,4 +335,83 @@ pub fn yank(
 
         Ok(())
     })
+}
+
+#[swirl::background_job]
+pub fn remove_crate(
+    conn: &PgConnection,
+    env: &Environment,
+    crate_id: i32,
+) -> Result<(), PerformError> {
+    use diesel::prelude::*;
+
+    let krate: CrateModel = CrateModel::all().find(crate_id).first(conn)?;
+
+    let repo = env.lock_index()?;
+    let index_file = repo.index_file(&krate.name);
+
+    conn.transaction(|| {
+        // Remove the crate from the database
+        diesel::delete(crates::table.find(krate.id)).execute(conn)?;
+
+        // Remove the file from the index and commit the changes.
+        std::fs::remove_file(index_file)?;
+        let message = format!("Removing crate `{}`", krate.name);
+        repo.commit_and_push(&message, &repo.relative_index_file(&krate.name))?;
+
+        Ok(())
+    })
+}
+
+#[swirl::background_job]
+pub fn remove_version(
+    conn: &PgConnection,
+    env: &Environment,
+    version_id: i32,
+) -> Result<(), PerformError> {
+    use diesel::prelude::*;
+
+    let version: Version = versions::table.find(version_id).first(conn)?;
+    let krate: CrateModel = CrateModel::all().find(version.crate_id).first(conn)?;
+
+    let repo = env.lock_index()?;
+    let index_file = repo.index_file(&krate.name);
+
+    conn.transaction(|| {
+        // Remove the version from the database
+        diesel::delete(versions::table.find(version.id)).execute(conn)?;
+
+        // Remove the line from the index and commit the changesd
+        let version_num = version.num.to_string();
+        filter_map_crate(&index_file, |git_crate| {
+            if git_crate.name == krate.name && git_crate.vers == version_num {
+                // If `None` is returned the line is deleted
+                None
+            } else {
+                Some(git_crate)
+            }
+        })?;
+        let message = format!("Removing crate version `{}#{}`", krate.name, version_num);
+        repo.commit_and_push(&message, &repo.relative_index_file(&krate.name))?;
+
+        Ok(())
+    })
+}
+
+fn filter_map_crate(path: &Path, f: impl Fn(Crate) -> Option<Crate>) -> Result<(), PerformError> {
+    let prev = fs::read_to_string(&path)?;
+
+    let mut new = Vec::new();
+    for line in prev.lines() {
+        let git_crate = serde_json::from_str::<Crate>(line)
+            .map_err(|_| format!("couldn't decode: `{}`", line))?;
+        if let Some(new_crate) = f(git_crate) {
+            new.push(serde_json::to_string(&new_crate)?);
+        }
+    }
+
+    let new = new.join("\n") + "\n";
+    fs::write(&path, new.as_bytes())?;
+
+    Ok(())
 }

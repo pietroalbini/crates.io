@@ -60,16 +60,8 @@ fn delete(conn: &PgConnection) {
         return;
     }
 
-    println!("deleting version {} ({})", v.num, v.id);
-    diesel::delete(versions::table.find(&v.id))
-        .execute(conn)
-        .unwrap();
-
-    print!("commit? [y/N]: ");
-    io::stdout().flush().unwrap();
-    let mut line = String::new();
-    io::stdin().read_line(&mut line).unwrap();
-    if !line.starts_with('y') {
-        panic!("aborting transaction");
-    }
+    git::remove_version(version.id)
+        .enqueue(&conn)
+        .expect("failed to enqueue the removal job");
+    println!("queued the job to remove the version from crates.io");
 }

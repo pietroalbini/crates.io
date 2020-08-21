@@ -1,4 +1,4 @@
-// Purge all references to a crate from the database.
+// Purge all references to a crate from the database and the index.
 //
 // Please be super sure you want to do this before running this.
 //
@@ -7,11 +7,12 @@
 
 #![warn(clippy::all, rust_2018_idioms)]
 
-use cargo_registry::{db, models::Crate, schema::crates};
+use cargo_registry::{db, git, models::Crate};
 use std::{
     env,
     io::{self, prelude::*},
 };
+use swirl::Job;
 
 use diesel::prelude::*;
 
@@ -45,17 +46,8 @@ fn delete(conn: &PgConnection) {
         return;
     }
 
-    println!("deleting the crate");
-    let n = diesel::delete(crates::table.find(krate.id))
-        .execute(conn)
-        .unwrap();
-    println!("  {} deleted", n);
-
-    print!("commit? [y/N]: ");
-    io::stdout().flush().unwrap();
-    let mut line = String::new();
-    io::stdin().read_line(&mut line).unwrap();
-    if !line.starts_with('y') {
-        panic!("aborting transaction");
-    }
+    git::remove_crate(krate.id)
+        .enqueue(&conn)
+        .expect("failed to enqueue the removal job");
+    println!("queued the job to remove the crate from crates.io");
 }
